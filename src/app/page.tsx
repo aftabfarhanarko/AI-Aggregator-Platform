@@ -26,9 +26,33 @@ import {
   Link,
   Shield,
   Menu,
-  X
+  X,
+  FileText,
+  AudioLines,
+  UploadCloud,
+  FolderOpen,
+  Download,
+  Loader2
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useAppDispatch, useAppSelector } from "@/lib/redux/store";
+import { updateConfig } from "@/lib/redux/slices/apiConfigSlice";
+import {
+  useSendChatMessageMutation,
+  useGetSessionsQuery,
+  useCreateSessionMutation,
+  useGetMessagesQuery,
+  useRenameSessionMutation,
+  useDeleteSessionMutation,
+} from "@/lib/redux/features/chatApi";
+import {
+  useGetModelsQuery,
+  useTranscribeAudioMutation,
+  useUploadFileMutation,
+  useListFilesQuery,
+  useLazyRetrieveFileQuery,
+  useLazyDownloadFileContentQuery,
+} from "@/lib/redux/features/gatewayApi";
 
 // TypeScript Interfaces
 interface Message {
@@ -70,6 +94,52 @@ interface AgentConfig {
 }
 
 export default function AgentPlayground() {
+  // --- Redux Store & RTK Query ---
+  const apiConfig = useAppSelector((state) => state.apiConfig);
+  const dispatch = useAppDispatch();
+
+  const [sendChatMessage] = useSendChatMessageMutation();
+  const [createSession] = useCreateSessionMutation();
+  const [renameSession] = useRenameSessionMutation();
+  const [deleteSession] = useDeleteSessionMutation();
+
+  const { data: dbSessions, isLoading: isLoadingSessions } = useGetSessionsQuery(undefined, {
+    skip: apiConfig.mode !== "live",
+  });
+
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+
+  // --- Gateway tab, file, and provider states ---
+  const [sidebarTab, setSidebarTab] = useState<"analytics" | "files">("analytics");
+  const [selectedProvider, setSelectedProvider] = useState<string>("openrouter");
+  const [audioFile, setAudioFile] = useState<File | null>(null);
+  const [uploadingFile, setUploadingFile] = useState<File | null>(null);
+  const [transcriptionResult, setTranscriptionResult] = useState<string>("");
+  const [filePurpose, setFilePurpose] = useState<string>("batch");
+  const [fileGatewayProvider, setFileGatewayProvider] = useState<string>("groq");
+  const [transcribeProvider, setTranscribeProvider] = useState<string>("groq");
+  const [transcribeModelId, setTranscribeModelId] = useState<string>("whisper-large-v3");
+
+  // --- Gateway API hooks ---
+  const { data: dynamicModels, isLoading: isLoadingModels } = useGetModelsQuery(
+    { provider: selectedProvider },
+    { skip: apiConfig.mode !== "live" }
+  );
+
+  const { data: filesData, refetch: refetchFiles } = useListFilesQuery(
+    { provider: fileGatewayProvider },
+    { skip: apiConfig.mode !== "live" }
+  );
+
+  const [transcribeAudio, { isLoading: isTranscribing }] = useTranscribeAudioMutation();
+  const [uploadFileMutation, { isLoading: isUploadingFile }] = useUploadFileMutation();
+  const [lazyRetrieveFile] = useLazyRetrieveFileQuery();
+  const [lazyDownloadContent] = useLazyDownloadFileContentQuery();
+
+  const { data: dbMessages } = useGetMessagesQuery(selectedSessionId || "", {
+    skip: apiConfig.mode !== "live" || !selectedSessionId,
+  });
+
   // --- States ---
   const [messages, setMessages] = useState<Message[]>([]);
   const [query, setQuery] = useState("");
@@ -80,20 +150,12 @@ export default function AgentPlayground() {
   // Sidebar Toggles (for responsiveness)
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [configOpen, setConfigOpen] = useState(true);
-  
-  // API Connection Settings (Allows user to configure credentials to connect their backend easily)
-  const [apiConfig, setApiConfig] = useState({
-    baseUrl: "http://localhost:5000/api/v1",
-    modelName: "deepseek-reasoner",
-    apiKey: "",
-    mode: "mock" // 'mock' or 'live'
-  });
 
   // Agent configuration settings
   const [agentConfig, setAgentConfig] = useState<AgentConfig>({
     name: "Web Aggregator Agent",
     systemPrompt: "You are an advanced search agent designed to crawl multiple index providers, compare documentation, extract key takeaways, and synthesize high-fidelity insights. Cite all sources.",
-    model: "DeepSeek R1",
+    model: "openrouter:deepseek/deepseek-r1",
     temperature: 0.3,
     maxTokens: 4096,
     tools: {
@@ -147,17 +209,17 @@ export default function AgentPlayground() {
         id: "welcome",
         role: "assistant",
         content: `### Welcome to **AGENTS.AI** — Multi-Engine Search Aggregator
-
+ 
 I am your active **${agentConfig.name}**, initialized with **${agentConfig.model}**.
-
+ 
 I can crawl, aggregate, and analyze complex information from multiple search engines, dev blogs, academic libraries, and codebases in parallel.
-
+ 
 **Here is what you can do:**
 * Ask me a complex question or search query.
 * Customize my instructions and system prompt in the **Agent Panel** on the right.
 * Check your search metrics and history count in the **History Analyzer** on the left.
 * Toggle **Deep Research** mode to run multi-step sub-agent logic.
-
+ 
 *What should we research today?*`,
         timestamp: new Date()
       }
@@ -167,17 +229,33 @@ I can crawl, aggregate, and analyze complex information from multiple search eng
     const savedApi = localStorage.getItem("agent_api_config");
     if (savedApi) {
       try {
-        setApiConfig(JSON.parse(savedApi));
+        dispatch(updateConfig(JSON.parse(savedApi)));
       } catch (e) {
         console.error(e);
       }
     }
   }, []);
 
+  // Sync loaded database messages to local messages feed
+  useEffect(() => {
+    if (apiConfig.mode === "live" && dbMessages) {
+      const mapped = dbMessages.map((m) => ({
+        id: m.id,
+        role: m.role as "user" | "assistant",
+        content: m.content,
+        timestamp: new Date(m.createdAt),
+        thinkingTime: m.latencyMs ? parseFloat((m.latencyMs / 1000).toFixed(2)) : undefined,
+        thinkingSteps: m.role === "assistant" ? ["Loaded from database", `Model: ${m.modelId}`, `Provider: ${m.provider}`] : undefined,
+        sources: []
+      }));
+      setMessages(mapped);
+    }
+  }, [dbMessages, apiConfig.mode]);
+
   // Save API config to localStorage helper
   const handleApiConfigChange = (key: string, value: string) => {
     const updated = { ...apiConfig, [key]: value };
-    setApiConfig(updated);
+    dispatch(updateConfig({ [key]: value }));
     localStorage.setItem("agent_api_config", JSON.stringify(updated));
   };
 
@@ -244,6 +322,67 @@ I can crawl, aggregate, and analyze complex information from multiple search eng
     setTimeout(() => setCopiedId(null), 2000);
   };
 
+  // --- Model configuration mapper helper ---
+  const mapModelToProviderAndId = (selectedModel: string): { provider: string; modelId: string } => {
+    if (selectedModel.includes(":")) {
+      const idx = selectedModel.indexOf(":");
+      const provider = selectedModel.substring(0, idx);
+      const modelId = selectedModel.substring(idx + 1);
+      return { provider, modelId };
+    }
+    switch (selectedModel) {
+      case "Gemini 1.5 Pro":
+      case "gemini-1.5-pro":
+        return { provider: "gemini", modelId: "gemini-1.5-pro" };
+      case "DeepSeek R1":
+        return { provider: "openrouter", modelId: "deepseek/deepseek-r1" };
+      case "Claude 3.5 Sonnet":
+        return { provider: "openrouter", modelId: "anthropic/claude-3.5-sonnet" };
+      case "GPT-4o":
+        return { provider: "openrouter", modelId: "openai/gpt-4o" };
+      default:
+        return { provider: "gemini", modelId: "gemini-1.5-flash" };
+    }
+  };
+
+  const handleNewSession = () => {
+    setSelectedSessionId(null);
+    setMessages([
+      {
+        id: `welcome-${Date.now()}`,
+        role: "assistant",
+        content: `### Welcome to **AGENTS.AI** — Multi-Engine Search Aggregator
+
+I am your active **${agentConfig.name}**, initialized with **${agentConfig.model}**.
+
+I can crawl, aggregate, and analyze complex information from multiple search engines, dev blogs, academic libraries, and codebases in parallel.
+
+**Here is what you can do:**
+* Ask me a complex question or search query.
+* Customize my instructions and system prompt in the **Agent Panel** on the right.
+* Check your search metrics and history count in the **History Analyzer** on the left.
+* Toggle **Deep Research** mode to run multi-step sub-agent logic.
+
+*What should we research today?*`,
+        timestamp: new Date()
+      }
+    ]);
+  };
+
+  const handleCreateSession = async () => {
+    try {
+      const { provider, modelId } = mapModelToProviderAndId(agentConfig.model);
+      const newSess = await createSession({
+        title: "New Research Session",
+        provider,
+        modelId
+      }).unwrap();
+      setSelectedSessionId(newSess.id);
+    } catch (err) {
+      console.error("Failed to create session:", err);
+    }
+  };
+
   // --- Run search query ---
   const handleSearchSubmit = async (e?: React.FormEvent, customQuery?: string) => {
     if (e) e.preventDefault();
@@ -283,7 +422,74 @@ I can crawl, aggregate, and analyze complex information from multiple search eng
 
     setMessages(prev => [...prev, agentMessagePlaceholder]);
 
-    // Simulate Agent execution flow
+    // Live mode backend call
+    if (apiConfig.mode === "live") {
+      try {
+        const { provider, modelId } = mapModelToProviderAndId(agentConfig.model);
+        
+        // Map messages to ChatMessage format (only role and content)
+        const pastMessages = messages.map((m) => ({
+          role: m.role,
+          content: m.content,
+        }));
+        
+        const apiMessages = [...pastMessages, { role: "user" as const, content: activeQuery }];
+
+        // Call backend chat API
+        const response = await sendChatMessage({
+          messages: apiMessages,
+          provider,
+          modelId,
+          sessionId: selectedSessionId || undefined,
+          temperature: agentConfig.temperature,
+          maxTokens: agentConfig.maxTokens,
+          systemPrompt: agentConfig.systemPrompt
+        }).unwrap();
+
+        // Update selected sessionId if backend returned one (user was authenticated and it created/used a session)
+        if (response.sessionId) {
+          setSelectedSessionId(response.sessionId);
+        }
+
+        // Update messages with backend response
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === agentMsgId
+              ? {
+                  ...m,
+                  content: response.content,
+                  isSearching: false,
+                  thinkingTime: response.latencyMs ? parseFloat((response.latencyMs / 1000).toFixed(2)) : undefined,
+                  thinkingSteps: [
+                    "API Call Succeeded",
+                    `Provider: ${response.provider}`,
+                    `Model: ${response.modelId}`,
+                  ],
+                }
+              : m
+          )
+        );
+      } catch (err: any) {
+        console.error(err);
+        const errorMessage = err?.data?.message || err?.message || "An error occurred while connecting to the model or search engines. Please try again.";
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === agentMsgId
+              ? {
+                  ...m,
+                  content: `### Connection Error\n${errorMessage}`,
+                  isSearching: false,
+                }
+              : m
+          )
+        );
+      } finally {
+        setIsGenerating(false);
+      }
+      return;
+    }
+
+    // Simulate Agent execution flow (Mock Mode)
     let steps: string[] = [];
     const updateSteps = (newStep: string) => {
       steps = [...steps, newStep];
@@ -379,113 +585,484 @@ I can crawl, aggregate, and analyze complex information from multiple search eng
           </button>
         </div>
 
-        {/* New Session Action */}
-        <div className="p-3">
-          <button 
-            onClick={() => {
-              setMessages([
-                {
-                  id: `welcome-${Date.now()}`,
-                  role: "assistant",
-                  content: `### Interactive Playground Reset\nReady for a new session. Setup your **Agent Panel** configuration or type in a query to query database aggregators.`,
-                  timestamp: new Date()
-                }
-              ]);
-            }}
-            className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100/80 hover:border-slate-300 text-xs font-semibold text-indigo-600 transition-all duration-200"
+        {/* Tab Buttons */}
+        <div className="flex px-3 pt-2.5 border-b border-slate-200/50 gap-1 shrink-0 bg-slate-50/50">
+          <button
+            onClick={() => setSidebarTab("analytics")}
+            className={cn(
+              "flex-1 flex items-center justify-center gap-1.5 py-2 px-2 rounded-t-lg text-[9px] font-bold uppercase tracking-wider transition-all duration-205 border-t border-x",
+              sidebarTab === "analytics"
+                ? "bg-white border-slate-200 text-indigo-650 shadow-sm"
+                : "border-transparent text-slate-500 hover:text-slate-705 hover:bg-slate-100/50"
+            )}
           >
-            <Plus className="h-4 w-4" />
-            New Research Session
+            <History className="h-3.5 w-3.5" />
+            Analytics
+          </button>
+          <button
+            onClick={() => setSidebarTab("files")}
+            className={cn(
+              "flex-1 flex items-center justify-center gap-1.5 py-2 px-2 rounded-t-lg text-[9px] font-bold uppercase tracking-wider transition-all duration-205 border-t border-x",
+              sidebarTab === "files"
+                ? "bg-white border-slate-200 text-indigo-650 shadow-sm"
+                : "border-transparent text-slate-500 hover:text-slate-705 hover:bg-slate-100/50"
+            )}
+          >
+            <FileText className="h-3.5 w-3.5" />
+            Files & Audio
           </button>
         </div>
 
-        {/* SEARCH METRICS / FREQUENCY */}
-        <div className="flex-1 overflow-y-auto px-3 py-2 flex flex-col gap-5">
-          <div>
-            <div className="flex items-center justify-between px-2 mb-2">
-              <span className="text-[11px] font-bold text-slate-500 uppercase tracking-widest flex items-center gap-1.5 font-mono">
-                <History className="h-3 w-3 text-cyan-600" />
-                History Analyzer
-              </span>
-              {searchHistory.length > 0 && (
-                <button 
-                  onClick={clearAllHistory}
-                  className="text-[10px] text-red-500 hover:text-red-600 font-mono font-semibold"
-                >
-                  Clear All
-                </button>
-              )}
+        {sidebarTab === "analytics" ? (
+          <>
+            {/* New Session Action */}
+            <div className="p-3 shrink-0">
+              <button 
+                onClick={handleNewSession}
+                className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100/80 hover:border-slate-300 text-xs font-semibold text-indigo-600 transition-all duration-205"
+              >
+                <Plus className="h-4 w-4" />
+                New Research Session
+              </button>
             </div>
 
-            {searchHistory.length === 0 ? (
-              <div className="p-4 rounded-lg bg-slate-50 border border-slate-200/50 text-center">
-                <p className="text-xs text-slate-400">No search records logged yet.</p>
-              </div>
-            ) : (
-              <div className="space-y-1">
-                {searchHistory.map((item, idx) => (
-                  <div
-                    key={idx}
-                    onClick={() => {
-                      setQuery(item.query);
-                      handleSearchSubmit(undefined, item.query);
-                    }}
-                    className="group flex items-center justify-between p-2 rounded-lg hover:bg-slate-100/80 border border-transparent hover:border-slate-200/60 cursor-pointer transition-all duration-150"
-                  >
-                    <div className="flex items-center gap-2 max-w-[80%]">
-                      <Search className="h-3.5 w-3.5 text-slate-400 shrink-0 group-hover:text-cyan-600 transition-colors" />
-                      <span className="text-xs text-slate-655 truncate font-mono">
-                        {item.query}
-                      </span>
-                    </div>
-                    
-                    <div className="flex items-center gap-2">
-                      <span className="px-1.5 py-0.5 rounded text-[10px] font-bold font-mono bg-slate-100 border border-slate-200/60 text-cyan-600 shadow-sm shrink-0">
-                        {item.count}x
-                      </span>
-                      <button 
-                        onClick={(e) => deleteHistoryItem(e, item.query)}
-                        className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-slate-200 text-slate-400 hover:text-red-500 transition-all shrink-0"
+            {/* SEARCH METRICS / FREQUENCY */}
+            <div className="flex-1 overflow-y-auto px-3 py-2 flex flex-col gap-5">
+              <div>
+                <div className="flex items-center justify-between px-2 mb-2">
+                  <span className="text-[11px] font-bold text-slate-500 uppercase tracking-widest flex items-center gap-1.5 font-mono">
+                    <History className="h-3 w-3 text-cyan-600" />
+                    History Analyzer
+                  </span>
+                  {searchHistory.length > 0 && (
+                    <button 
+                      onClick={clearAllHistory}
+                      className="text-[10px] text-red-500 hover:text-red-600 font-mono font-semibold"
+                    >
+                      Clear All
+                    </button>
+                  )}
+                </div>
+
+                {searchHistory.length === 0 ? (
+                  <div className="p-4 rounded-lg bg-slate-50 border border-slate-200/50 text-center">
+                    <p className="text-xs text-slate-400">No search records logged yet.</p>
+                  </div>
+                ) : (
+                  <div className="space-y-1">
+                    {searchHistory.map((item, idx) => (
+                      <div
+                        key={idx}
+                        onClick={() => {
+                          setQuery(item.query);
+                          handleSearchSubmit(undefined, item.query);
+                        }}
+                        className="group flex items-center justify-between p-2 rounded-lg hover:bg-slate-100/80 border border-transparent hover:border-slate-200/60 cursor-pointer transition-all duration-150"
                       >
-                        <Trash2 className="h-3 w-3" />
-                      </button>
+                        <div className="flex items-center gap-2 max-w-[80%]">
+                          <Search className="h-3.5 w-3.5 text-slate-400 shrink-0 group-hover:text-cyan-600 transition-colors" />
+                          <span className="text-xs text-slate-655 truncate font-mono">
+                            {item.query}
+                          </span>
+                        </div>
+                        
+                        <div className="flex items-center gap-2">
+                          <span className="px-1.5 py-0.5 rounded text-[10px] font-bold font-mono bg-slate-100 border border-slate-200/60 text-cyan-600 shadow-sm shrink-0">
+                            {item.count}x
+                          </span>
+                          <button 
+                            onClick={(e) => deleteHistoryItem(e, item.query)}
+                            className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-slate-200 text-slate-400 hover:text-red-500 transition-all shrink-0"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Cloud Sessions list */}
+              {apiConfig.mode === "live" && (
+                <div className="mt-2 border-t border-slate-200/60 pt-3">
+                  <div className="flex items-center justify-between px-2 mb-2">
+                    <span className="text-[11px] font-bold text-slate-500 uppercase tracking-widest flex items-center gap-1.5 font-mono">
+                      <Globe className="h-3 w-3 text-indigo-655 animate-pulse" />
+                      Cloud Sessions
+                    </span>
+                    <button 
+                      onClick={handleCreateSession}
+                      className="text-[10px] text-indigo-600 hover:text-indigo-700 font-mono font-semibold"
+                    >
+                      + New
+                    </button>
+                  </div>
+                  
+                  {isLoadingSessions ? (
+                    <div className="p-2 text-center text-xs text-slate-400">Loading sessions...</div>
+                  ) : !dbSessions || dbSessions.length === 0 ? (
+                    <div className="p-4 rounded-lg bg-slate-50 border border-slate-200/50 text-center">
+                      <p className="text-xs text-slate-400">
+                        No sessions found. Start a conversation or hit + New.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="space-y-1 max-h-48 overflow-y-auto pr-1">
+                      {dbSessions.map((session) => (
+                        <div
+                          key={session.id}
+                          onClick={() => setSelectedSessionId(session.id)}
+                          className={cn(
+                            "group flex items-center justify-between p-2 rounded-lg cursor-pointer transition-all duration-150 border text-left",
+                            selectedSessionId === session.id
+                              ? "bg-indigo-50/80 border-indigo-200 text-indigo-950 font-semibold"
+                              : "hover:bg-slate-100/80 border-transparent hover:border-slate-200/60 text-slate-700"
+                          )}
+                        >
+                          <div className="flex items-center gap-2 max-w-[70%]">
+                            <History className="h-3.5 w-3.5 text-slate-400 shrink-0 group-hover:text-indigo-650" />
+                            <span className="text-xs truncate font-sans">
+                              {session.title}
+                            </span>
+                          </div>
+                          
+                          <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all shrink-0">
+                            <button
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                const newTitle = prompt("Rename session:", session.title);
+                                if (newTitle) {
+                                  await renameSession({ sessionId: session.id, title: newTitle });
+                                }
+                              }}
+                              className="p-0.5 rounded hover:bg-slate-200 text-slate-400 hover:text-indigo-600"
+                            >
+                              <Sliders className="h-3 w-3" />
+                            </button>
+                            <button
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                if (confirm("Delete this session?")) {
+                                  await deleteSession(session.id);
+                                  if (selectedSessionId === session.id) {
+                                    setSelectedSessionId(null);
+                                  }
+                                }
+                              }}
+                              className="p-0.5 rounded hover:bg-slate-200 text-slate-400 hover:text-red-500"
+                            >
+                              <Trash2 className="h-3 w-3" />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Quick Stats Panel */}
+              <div className="rounded-lg bg-slate-50 border border-slate-200/60 p-3 space-y-2 mt-auto">
+                <h3 className="text-xs font-bold text-slate-655 flex items-center gap-1.5">
+                  <Layers className="h-3.5 w-3.5 text-indigo-500" />
+                  Index Aggregation Metrics
+                </h3>
+                <div className="grid grid-cols-2 gap-2 text-[10px] font-mono">
+                  <div className="p-2 rounded bg-white border border-slate-200/65 shadow-xs">
+                    <div className="text-slate-400">Queries Routed</div>
+                    <div className="text-xs font-bold text-slate-700 mt-0.5">
+                      {searchHistory.reduce((acc, curr) => acc + curr.count, 0)}
                     </div>
                   </div>
-                ))}
+                  <div className="p-2 rounded bg-white border border-slate-200/65 shadow-xs">
+                    <div className="text-slate-400">Unique Topics</div>
+                    <div className="text-xs font-bold text-slate-700 mt-0.5">
+                      {searchHistory.length}
+                    </div>
+                  </div>
+                  <div className="p-2 rounded bg-white border border-slate-200/65 shadow-xs">
+                    <div className="text-slate-400">Avg Response</div>
+                    <div className="text-xs font-bold text-slate-700 mt-0.5">2.44s</div>
+                  </div>
+                  <div className="p-2 rounded bg-white border border-slate-200/65 shadow-xs">
+                    <div className="text-slate-400">Active Engines</div>
+                    <div className="text-xs font-bold text-slate-700 mt-0.5">{selectedEngines.length}/4</div>
+                  </div>
+                </div>
               </div>
-            )}
-          </div>
+            </div>
+          </>
+        ) : (
+          <div className="flex-1 overflow-y-auto px-3 py-3 flex flex-col gap-4">
+            {/* Audio Transcription Panel */}
+            <div className="rounded-xl border border-slate-200/80 bg-slate-50/50 p-3.5 space-y-3.5 shadow-sm">
+              <h3 className="text-xs font-bold text-slate-700 flex items-center gap-1.5 uppercase tracking-wider font-mono">
+                <AudioLines className="h-4 w-4 text-cyan-600 animate-pulse" />
+                Audio Transcription
+              </h3>
+              
+              <div className="space-y-2 text-[11px]">
+                <div>
+                  <label className="text-[9px] font-bold text-slate-400 uppercase font-mono block mb-1">
+                    Select Audio File
+                  </label>
+                  <input
+                    type="file"
+                    accept="audio/*"
+                    onChange={(e) => setAudioFile(e.target.files?.[0] || null)}
+                    className="w-full text-xs text-slate-500 file:mr-2 file:py-1 file:px-2 file:rounded-md file:border-0 file:text-[10px] file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100 cursor-pointer bg-white p-1.5 rounded-lg border border-slate-200"
+                  />
+                  {audioFile && (
+                    <p className="text-[9px] text-slate-450 mt-1 truncate">
+                      File: {audioFile.name} ({Math.round(audioFile.size / 1024)} KB)
+                    </p>
+                  )}
+                </div>
 
-          {/* Quick Stats Panel */}
-          <div className="rounded-lg bg-slate-50 border border-slate-200/60 p-3 space-y-2">
-            <h3 className="text-xs font-bold text-slate-600 flex items-center gap-1.5">
-              <Layers className="h-3.5 w-3.5 text-indigo-500" />
-              Index Aggregation Metrics
-            </h3>
-            <div className="grid grid-cols-2 gap-2 text-[10px] font-mono">
-              <div className="p-2 rounded bg-white border border-slate-200/65 shadow-xs">
-                <div className="text-slate-400">Queries Routed</div>
-                <div className="text-xs font-bold text-slate-700 mt-0.5">
-                  {searchHistory.reduce((acc, curr) => acc + curr.count, 0)}
+                <div className="grid grid-cols-2 gap-1.5">
+                  <div>
+                    <label className="text-[9px] font-bold text-slate-400 uppercase font-mono block mb-1">
+                      Provider
+                    </label>
+                    <select
+                      value={transcribeProvider}
+                      onChange={(e) => {
+                        setTranscribeProvider(e.target.value);
+                        if (e.target.value === "groq") setTranscribeModelId("whisper-large-v3");
+                        else if (e.target.value === "gemini") setTranscribeModelId("gemini-1.5-flash");
+                      }}
+                      className="w-full text-[10px] py-1 px-1.5 rounded-md bg-white border border-slate-200 focus:outline-none focus:border-indigo-500/50"
+                    >
+                      <option value="groq">Groq</option>
+                      <option value="gemini">Gemini</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-[9px] font-bold text-slate-400 uppercase font-mono block mb-1">
+                      Model ID
+                    </label>
+                    <input
+                      type="text"
+                      value={transcribeModelId}
+                      onChange={(e) => setTranscribeModelId(e.target.value)}
+                      className="w-full text-[10px] py-1 px-1.5 rounded-md bg-white border border-slate-200 focus:outline-none focus:border-indigo-500/50"
+                    />
+                  </div>
                 </div>
+
+                <button
+                  onClick={async () => {
+                    if (!audioFile) {
+                      alert("Please select an audio file first!");
+                      return;
+                    }
+                    try {
+                      setTranscriptionResult("Transcribing audio, please wait...");
+                      const res = await transcribeAudio({
+                        file: audioFile,
+                        provider: transcribeProvider,
+                        modelId: transcribeModelId,
+                      }).unwrap();
+                      setTranscriptionResult(res.text || "No text was transcribed.");
+                    } catch (err: any) {
+                      setTranscriptionResult(`Error: ${err.data?.message || err.message}`);
+                    }
+                  }}
+                  disabled={isTranscribing || !audioFile}
+                  className="w-full flex items-center justify-center gap-1.5 py-1.5 px-3 rounded-lg bg-cyan-600 hover:bg-cyan-750 disabled:bg-slate-200 text-white font-bold text-xs transition-colors shadow-xs"
+                >
+                  {isTranscribing ? (
+                    <>
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      Processing...
+                    </>
+                  ) : (
+                    "Transcribe Audio"
+                  )}
+                </button>
+
+                {transcriptionResult && (
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[9px] font-bold text-slate-400 uppercase font-mono">Result:</span>
+                      <button
+                        onClick={() => {
+                          setQuery(transcriptionResult);
+                          setSidebarTab("analytics");
+                        }}
+                        className="text-[9px] text-cyan-650 hover:underline font-bold"
+                      >
+                        Copy to input
+                      </button>
+                    </div>
+                    <div className="p-2 rounded bg-white border border-slate-200 text-[10px] text-slate-700 max-h-24 overflow-y-auto font-mono whitespace-pre-wrap select-text leading-relaxed">
+                      {transcriptionResult}
+                    </div>
+                  </div>
+                )}
               </div>
-              <div className="p-2 rounded bg-white border border-slate-200/65 shadow-xs">
-                <div className="text-slate-400">Unique Topics</div>
-                <div className="text-xs font-bold text-slate-700 mt-0.5">
-                  {searchHistory.length}
+            </div>
+
+            {/* File Management Panel */}
+            <div className="rounded-xl border border-slate-200/80 bg-slate-50/50 p-3.5 space-y-3 shadow-sm">
+              <div className="flex items-center justify-between">
+                <h3 className="text-xs font-bold text-slate-700 flex items-center gap-1.5 uppercase tracking-wider font-mono">
+                  <FolderOpen className="h-4 w-4 text-indigo-500" />
+                  Files Gateway
+                </h3>
+                <select
+                  value={fileGatewayProvider}
+                  onChange={(e) => setFileGatewayProvider(e.target.value)}
+                  className="text-[9px] py-0.5 px-1 bg-white border border-slate-200 rounded font-bold text-slate-655"
+                >
+                  <option value="groq">Groq</option>
+                  <option value="gemini">Gemini</option>
+                </select>
+              </div>
+
+              <div className="space-y-2.5 text-[11px]">
+                {/* Upload Section */}
+                <div className="space-y-1.5">
+                  <label className="text-[9px] font-bold text-slate-400 uppercase font-mono block">
+                    Upload Dataset
+                  </label>
+                  <div className="flex gap-1.5">
+                    <input
+                      type="file"
+                      onChange={(e) => setUploadingFile(e.target.files?.[0] || null)}
+                      className="flex-1 text-[10px] text-slate-550 file:mr-2 file:py-1 file:px-1.5 file:rounded file:border-0 file:text-[9px] file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100 bg-white p-1 rounded border border-slate-200"
+                    />
+                    <select
+                      value={filePurpose}
+                      onChange={(e) => setFilePurpose(e.target.value)}
+                      className="text-[9px] py-1 px-1 bg-white border border-slate-200 rounded font-semibold text-slate-700"
+                    >
+                      <option value="batch">batch</option>
+                      <option value="fine-tune">fine-tune</option>
+                    </select>
+                  </div>
+
+                  <button
+                    onClick={async () => {
+                      if (!uploadingFile) {
+                        alert("Please select a file to upload!");
+                        return;
+                      }
+                      try {
+                        await uploadFileMutation({
+                          file: uploadingFile,
+                          purpose: filePurpose,
+                          provider: fileGatewayProvider,
+                        }).unwrap();
+                        alert("File uploaded successfully!");
+                        setUploadingFile(null);
+                        refetchFiles();
+                      } catch (err: any) {
+                        alert(`Upload failed: ${err.data?.message || err.message}`);
+                      }
+                    }}
+                    disabled={isUploadingFile || !uploadingFile}
+                    className="w-full flex items-center justify-center gap-1.5 py-1.5 px-3 rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-200 text-white font-bold text-xs transition-colors shadow-xs"
+                  >
+                    {isUploadingFile ? (
+                      <>
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        Uploading...
+                      </>
+                    ) : (
+                      "Upload to Gateway"
+                    )}
+                  </button>
                 </div>
-              </div>
-              <div className="p-2 rounded bg-white border border-slate-200/65 shadow-xs">
-                <div className="text-slate-400">Avg Response</div>
-                <div className="text-xs font-bold text-slate-700 mt-0.5">2.44s</div>
-              </div>
-              <div className="p-2 rounded bg-white border border-slate-200/65 shadow-xs">
-                <div className="text-slate-400">Active Engines</div>
-                <div className="text-xs font-bold text-slate-700 mt-0.5">{selectedEngines.length}/4</div>
+
+                {/* Files List */}
+                <div className="space-y-1.5">
+                  <div className="flex justify-between items-center">
+                    <span className="text-[9px] font-bold text-slate-400 uppercase font-mono">
+                      Uploaded Files
+                    </span>
+                    <button
+                      onClick={() => refetchFiles()}
+                      className="text-[9px] text-indigo-650 hover:underline font-bold"
+                    >
+                      Refresh
+                    </button>
+                  </div>
+
+                  {!filesData || !filesData.data || filesData.data.length === 0 ? (
+                    <div className="p-3 text-center text-slate-400 bg-white border border-slate-200/50 rounded-lg">
+                      No files found on this provider.
+                    </div>
+                  ) : (
+                    <div className="space-y-1 max-h-32 overflow-y-auto pr-1">
+                      {filesData.data.map((file) => (
+                        <div
+                          key={file.id}
+                          className="p-1.5 rounded bg-white border border-slate-200/70 flex items-center justify-between text-[10px] text-slate-700"
+                        >
+                          <div className="truncate max-w-[65%] space-y-0.5">
+                            <p className="font-semibold text-slate-800 truncate" title={file.filename}>
+                              {file.filename}
+                            </p>
+                            <p className="text-[9px] text-slate-400 truncate">
+                              ID: {file.id}
+                            </p>
+                          </div>
+
+                          <div className="flex items-center gap-1">
+                            <button
+                              onClick={async () => {
+                                try {
+                                  const details = await lazyRetrieveFile({
+                                    fileId: file.id,
+                                    provider: fileGatewayProvider,
+                                  }).unwrap();
+                                  alert(JSON.stringify(details, null, 2));
+                                } catch (err: any) {
+                                  alert(`Retrieve failed: ${err.data?.message || err.message}`);
+                                }
+                              }}
+                              title="File Info"
+                              className="p-1 hover:bg-slate-100 rounded text-slate-500"
+                            >
+                              <Info className="h-3 w-3" />
+                            </button>
+
+                            <button
+                              onClick={async () => {
+                                try {
+                                  const blob = await lazyDownloadContent({
+                                    fileId: file.id,
+                                    provider: fileGatewayProvider,
+                                  }).unwrap();
+                                  const url = window.URL.createObjectURL(blob);
+                                  const a = document.createElement("a");
+                                  a.href = url;
+                                  a.download = file.filename;
+                                  document.body.appendChild(a);
+                                  a.click();
+                                  a.remove();
+                                  window.URL.revokeObjectURL(url);
+                                } catch (err: any) {
+                                  alert(`Download failed: ${err.data?.message || err.message}`);
+                                }
+                              }}
+                              title="Download Content"
+                              className="p-1 hover:bg-slate-100 rounded text-indigo-650"
+                            >
+                              <Download className="h-3 w-3" />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           </div>
-        </div>
+        )}
 
         {/* API Local Credentials Connection Drawer */}
         <div className="p-3 border-t border-slate-200/80 bg-slate-50/50 space-y-2.5">
@@ -901,7 +1478,7 @@ I can crawl, aggregate, and analyze complex information from multiple search eng
             />
           </div>
 
-          {/* Model selection */}
+          {/* Base Reasoning Model Selection */}
           <div className="space-y-1.5">
             <label className="text-[11px] font-bold text-slate-500 uppercase tracking-wider font-mono">
               Base Reasoning Model
@@ -909,12 +1486,24 @@ I can crawl, aggregate, and analyze complex information from multiple search eng
             <select
               value={agentConfig.model}
               onChange={(e) => setAgentConfig({ ...agentConfig, model: e.target.value })}
-              className="w-full text-xs py-2 px-3 rounded-lg bg-white border border-slate-200 text-slate-800 focus:outline-none focus:border-indigo-500/50 shadow-xs"
+              className="w-full text-xs py-2 px-3 rounded-lg bg-white border border-slate-200 text-slate-800 focus:outline-none focus:border-indigo-500/50 shadow-xs font-medium"
             >
-              <option value="DeepSeek R1">DeepSeek R1 (Reasoning)</option>
-              <option value="Claude 3.5 Sonnet">Claude 3.5 Sonnet</option>
-              <option value="GPT-4o">GPT-4o (Standard)</option>
-              <option value="Gemini 1.5 Pro">Gemini 1.5 Pro</option>
+              <optgroup label="Groq Cloud (Ultra-Fast)">
+                <option value="groq:llama3-8b-8192">Llama 3 8B (llama3-8b-8192)</option>
+                <option value="groq:llama-3.1-70b-versatile">Llama 3.1 70B (llama-3.1-70b-versatile)</option>
+                <option value="groq:mixtral-8x7b-32768">Mixtral 8x7B (mixtral-8x7b-32768)</option>
+                <option value="groq:gemma2-9b-it">Gemma 2 9B (gemma2-9b-it)</option>
+              </optgroup>
+              <optgroup label="OpenRouter (OpenAI, DeepSeek, Claude)">
+                <option value="openrouter:deepseek/deepseek-r1">DeepSeek R1 (deepseek/deepseek-r1)</option>
+                <option value="openrouter:openai/gpt-4o">OpenAI GPT-4o (openai/gpt-4o)</option>
+                <option value="openrouter:openai/gpt-4o-mini">OpenAI GPT-4o Mini (openai/gpt-4o-mini)</option>
+                <option value="openrouter:anthropic/claude-3.5-sonnet">Claude 3.5 Sonnet (anthropic/claude-3.5-sonnet)</option>
+              </optgroup>
+              <optgroup label="Google Gemini (Native)">
+                <option value="gemini:gemini-1.5-flash">Gemini 1.5 Flash (gemini-1.5-flash)</option>
+                <option value="gemini:gemini-1.5-pro">Gemini 1.5 Pro (gemini-1.5-pro)</option>
+              </optgroup>
             </select>
           </div>
 
